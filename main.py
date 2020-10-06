@@ -74,23 +74,13 @@ def gen_v(comp):
   arg_signed = comp.get_point_signed()
   params = convert_to_map(comp.get_params())
   states = convert_to_map(comp.get_state_vars())
-  logics = "" 
+  logics = ""
   for l in list(params.values()) + list(states.values()):
     logics += "logic {}[{}:0] {};\n".format("signed " if (l.signed) else "", l.bits - 1, ('p_' if l.name in params else 's_') + l.name)
   logics += "\n"
-
-  state_mappings = {s: "" for s in states}
-  temp_mappings = {}
-  def incr_mapping(mappings, var):
-    nonlocal logics
-    if mappings == temp_mappings and var not in mappings:
-      mappings[var] = ""
-    else:
-      mappings[var] = str(int("0" if mappings[var] == "" else mappings[var]) + 1)
-    if mappings == state_mappings:
-      logics += "logic {}[{}:0] s_{}{};\n".format("signed " if (states[var].signed) else "", states[var].bits - 1, var, mappings[var])
-    else:
-      logics += "logic signed [31:0] t_{}{};\n".format(var, mappings[var])
+  for l in states.values():
+    logics += "logic {}[{}:0] ns_{};\n".format("signed " if (l.signed) else "", l.bits - 1, l.name)
+  logics += "\n"
 
   def op_to_str(op):
     if isinstance(op, ast.Eq): return "=="
@@ -106,31 +96,37 @@ def gen_v(comp):
   def wrap(expr): return "(" + expr + ")"
   def unwrap(expr): return expr[1:-1] if expr[0] == '(' else expr
 
+  def sign_binop(left_exp, right_exp):
+    left, ls = left_exp
+    right, rs = right_exp
+    if ls and not rs:
+      right = "$signed(" + unwrap(right) + ")"
+    if rs and not ls:
+      left = "$signed(" + unwrap(left) + ")"
+    return (left, right, ls or rs)
+
   indent_spaces = 0
+  temps = set()
   def gen_expr(expr): # return str expr as well as whether signed
     nonlocal indent_spaces
+    nonlocal logics
     if isinstance(expr, ast.Compare):
-      return (wrap(gen_expr(expr.left)[0] + op_to_str(get_only(expr.ops)) + gen_expr(get_only(expr.comparators))[0]), False)
+      return (wrap(gen_expr(expr.left)[0] + " " + op_to_str(get_only(expr.ops)) + " " + gen_expr(get_only(expr.comparators))[0]), False)
     if isinstance(expr, ast.BinOp):
-      left, ls = gen_expr(expr.left)
-      right, rs = gen_expr(expr.right)
-      if ls and not rs:
-        right = "$signed(" + right + ")"
-      if rs and not ls:
-        left = "$signed(" + left + ")"
-      return (wrap(left + op_to_str(expr.op) + right), ls or rs)
+      left, right, signed = sign_binop(gen_expr(expr.left), gen_expr(expr.right))
+      return (wrap(left + " " + op_to_str(expr.op) + " " + right), signed)
     if isinstance(expr, ast.BoolOp):
       return (wrap((" " + op_to_str(expr.op) + " ").join(map(lambda x: gen_expr(x)[0], expr.values))), False)
     if isinstance(expr, ast.Attribute):
       if expr.attr in params:
         return ("p_" + expr.attr, params[expr.attr].signed)
       else:
-        return ("s_" + expr.attr + state_mappings[expr.attr], states[expr.attr].signed)
+        return ("ns_" + expr.attr, states[expr.attr].signed)
     if isinstance(expr, ast.Name):
       if expr.id == arg:
         return ("input_slice", arg_signed)
       else:
-        return ("t_" + expr.id + temp_mappings[expr.id], True)
+        return ("t_" + expr.id, True)
     if isinstance(expr, ast.Num):
       return (str(expr.n), expr.n < 0)
     if isinstance(expr, ast.IfExp):
@@ -155,23 +151,23 @@ def gen_v(comp):
       return result
     if isinstance(expr, ast.Assign):
       target = get_only(expr.targets)
-      mappings, name = (state_mappings, target.attr) if isinstance(target, ast.Attribute) else (temp_mappings, target.id)
-      val = unwrap(gen_expr(expr.value)[0])
-      incr_mapping(mappings, name)
-      return (' ' * indent_spaces) + gen_expr(target)[0] + " = " + val + ";\n"
+      if isinstance(target, ast.Name) and target.id not in temps:
+        logics += "logic signed [31:0] t_{};\n".format(target.id)
+        temps.add(target.id)
+      return (' ' * indent_spaces) + gen_expr(target)[0] + " = " + unwrap(gen_expr(expr.value)[0]) + ";\n"
     if isinstance(expr, ast.AugAssign):
-      mappings, name = (state_mappings, expr.target.attr) if isinstance(expr.target, ast.Attribute) else (temp_mappings, expr.target.id)
-      val = gen_expr(expr.value)[0]
-      target_orig = gen_expr(expr.target)[0]
-      incr_mapping(mappings, name)
-      return (' ' * indent_spaces) + gen_expr(expr.target)[0] + " = " + target_orig + " " + op_to_str(expr.op) + " " + val + ";\n"
+      target_expr = gen_expr(expr.target)
+      rhs_l, rhs_r, _ = sign_binop(target_expr, gen_expr(expr.value))
+      return (' ' * indent_spaces) + target_expr[0] + " = " + rhs_l + " " + op_to_str(expr.op) + " " + rhs_r + ";\n"
     raise Exception("unknown expr " + str(expr) + " on line " + str(first_line + expr.lineno))
 
   next_states = ""
+  for s in states.values():
+    next_states += "ns_{name} = s_{name};\n".format(name=s.name)
   for stmt in comp_ast.body:
     next_states += gen_expr(stmt)
   next_states = textwrap.indent(next_states, '  ')
- 
+
   param_setting = ""
   for i, p in enumerate(params.keys()):
     param_setting += ("if (param_input_counter == {}) begin\n"
@@ -190,7 +186,7 @@ def gen_v(comp):
   state_vars_update = ""
   for s in states.values():
     state_vars_init += "s_{} <= {};\n".format(s.name, s.init)
-    state_vars_update += "s_{} <= s_{}{};\n".format(s.name, s.name, state_mappings[s.name])
+    state_vars_update += "s_{name} <= ns_{name};\n".format(name=s.name)
   state_vars_init = textwrap.indent(state_vars_init, ' ' * 4)
   state_vars_update = textwrap.indent(state_vars_update, ' ' * 4)
 
