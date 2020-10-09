@@ -179,7 +179,7 @@ def gen_v(comp):
   for i, s in enumerate(states.keys()):
     output_state_selection += ("{}if (state_output_counter == {}) begin\n"
                                "  output_word_wire = s_{};\n"
-                               "end").format(" else " if i > 0 else "", i, p)
+                               "end").format(" else " if i > 0 else "", i, s)
   output_state_selection = textwrap.indent(output_state_selection, '  ')
 
   state_vars_init = ""
