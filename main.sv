@@ -6,7 +6,6 @@ module {comp_name}(
   input input_finished,
   output [31:0] output_word,
   output output_valid,
-  output output_finished,
   input output_ready
 );
 
@@ -69,6 +68,5 @@ end
 
 assign output_word = output_word_wire;
 assign output_valid = input_finished_reg && !state_output_finished;
-assign output_finished = state_output_finished;
 endmodule
 
